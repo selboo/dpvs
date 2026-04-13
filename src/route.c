@@ -203,16 +203,39 @@ static struct route_entry *route_in_net_lookup(const struct netif_port *port,
     return NULL;
 }
 
-static struct route_entry *route_out_net_lookup(const struct in_addr *dest)
+static struct route_entry *route_out_net_lookup(const struct in_addr *dest,
+                                                 const struct netif_port *src_port)
 {
     struct route_entry *route_node;
-    list_for_each_entry(route_node, &this_net_route_table, list){
-        if (net_cmp(route_node->port, dest->s_addr, route_node->netmask, route_node)){
-            rte_atomic32_inc(&route_node->refcnt);
-            return route_node;
+    struct route_entry *best_match = NULL;
+
+    list_for_each_entry(route_node, &this_net_route_table, list) {
+        if (!ip_addr_netcmp(dest->s_addr, route_node->netmask, route_node))
+            continue;
+
+        /* First destination match is the longest prefix. */
+        if (!best_match) {
+            best_match = route_node;
+            /* No source hint, or already on the right port -- done. */
+            if (!src_port || route_node->port->id == src_port->id)
+                break;
+            continue;
+        }
+
+        /* Moved to a shorter prefix -- longer prefix always wins. */
+        if (route_node->netmask < best_match->netmask)
+            break;
+
+        /* Same prefix length: prefer the route on src_port. */
+        if (src_port && route_node->port->id == src_port->id) {
+            best_match = route_node;
+            break;
         }
     }
-    return NULL;
+
+    if (best_match)
+        rte_atomic32_inc(&best_match->refcnt);
+    return best_match;
 }
 
 static int route_local_add(struct in_addr* dest, uint8_t netmask, uint32_t flag,
@@ -415,17 +438,25 @@ uint32_t route_select_addr(struct netif_port *port)
 struct route_entry *route4_output(const struct flow4 *fl4)
 {
     struct route_entry *route;
-
+    struct route_entry *src_rt;
+    struct netif_port *src_port = NULL;
 
     route = route_out_local_lookup(fl4->fl4_daddr.s_addr);
-    if(route){
+    if (route)
         return route;
+
+    /* Determine the preferred output port from source address. */
+    if (fl4->fl4_saddr.s_addr != htonl(INADDR_ANY)) {
+        src_rt = route_out_local_lookup(fl4->fl4_saddr.s_addr);
+        if (src_rt) {
+            src_port = src_rt->port;
+            route4_put(src_rt);
+        }
     }
 
-    route = route_out_net_lookup(&fl4->fl4_daddr);
-    if(route){
+    route = route_out_net_lookup(&fl4->fl4_daddr, src_port);
+    if (route)
         return route;
-    }
 
     return NULL;
 }

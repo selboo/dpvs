@@ -13,6 +13,7 @@ DPVS Tutorial
 * [Tunnel Mode(one-arm)](#tunnel)
 * [NAT Mode(one-arm)](#nat)
 * [SNAT Mode (two-arm)](#snat)
+* [Policy Routing (Source-In, Source-Out)](#policy-routing)
 * [IPv6 Support](#ipv6_support)
 * [Virtual devices](#virt-dev)
   - [Bonding Device](#vdev-bond)
@@ -846,6 +847,148 @@ Then try Internet access from hosts through SNAT `DPVS` server.
 host$ ping www.iqiyi.com
 host$ curl www.iqiyi.com
 ```
+
+<a id='policy-routing'/>
+
+# Policy Routing (Source-In, Source-Out)
+
+In multi-ISP environments without BGP, each ISP line has its own public IP range and gateway. DPVS needs to route return traffic back through the same interface it arrived on. This is equivalent to Linux's `ip rule from <src> table X` policy routing.
+
+DPVS implements source-based route selection in `route4_output()`: when the outbound packet carries a source address (VIP), the routing lookup determines which interface owns that VIP and prefers routes on that interface. This works automatically for all forwarding modes (FNAT, SNAT, NAT) — no extra configuration is needed beyond setting up per-VLAN default routes.
+
+## Topology
+
+```
+                          +--+--+--+--+--+
+                          |  DPVS (LB)   |
+                          +--+--+--+--+--+
+                           |    |    |
+                     bond0.1  bond0.2  bond0.3
+                     VLAN 1   VLAN 2   VLAN 3
+                       |        |        |
+              +--------+  +-----+--+  +--+-------+
+              |Telecom |  |Unicom  |  |Mobile    |
+              |GW .1   |  |GW .1   |  |GW .1    |
+              +--------+  +--------+  +---------+
+ Net: 219.141.136.0/24  202.106.0.0/24  117.200.23.0/24
+ VIP: 219.141.136.10   202.106.0.20    117.200.23.22
+```
+
+All three ISP lines share a single bonding interface (`bond0`) through VLAN sub-interfaces. Each VLAN has its own VIP, LIP pool, and default gateway.
+
+## Setup
+
+### Step 1: Configure Bonding and VLAN Interfaces
+
+Make sure the bonding device (`bond0`) is configured in `/etc/dpvs.conf`. Then create VLAN sub-interfaces:
+
+```bash
+#!/bin/sh -
+
+# Create VLAN devices on bond0
+dpip vlan add link bond0 id 1       # bond0.1 — Telecom
+dpip vlan add link bond0 id 2       # bond0.2 — Unicom
+dpip vlan add link bond0 id 3       # bond0.3 — Mobile
+```
+
+### Step 2: Assign IP Addresses
+
+Assign VIP and LIP addresses to each VLAN interface:
+
+```bash
+# --- Telecom (bond0.1) ---
+# VIP for virtual services
+dpip addr add 219.141.136.10/24 dev bond0.1
+# LIP pool for FNAT
+dpip addr add 219.141.136.100/24 dev bond0.1 sapool
+
+# --- Unicom (bond0.2) ---
+dpip addr add 202.106.0.20/24 dev bond0.2
+dpip addr add 202.106.0.100/24 dev bond0.2 sapool
+
+# --- Mobile (bond0.3) ---
+dpip addr add 117.200.23.22/24 dev bond0.3
+dpip addr add 117.200.23.100/24 dev bond0.3 sapool
+```
+
+### Step 3: Add Per-VLAN Default Routes
+
+This is the key step. Add one default route per ISP gateway, each pointing to the corresponding VLAN device:
+
+```bash
+dpip route add default via 219.141.136.1 dev bond0.1    # Telecom gateway
+dpip route add default via 202.106.0.1   dev bond0.2    # Unicom gateway
+dpip route add default via 117.200.23.1  dev bond0.3    # Mobile gateway
+```
+
+DPVS allows multiple default routes on different devices. When a packet is sent out with a source VIP, `route4_output()` looks up the VIP in the local address table, finds which interface it belongs to, and selects the default route on that interface.
+
+### Step 4: Configure Virtual Services
+
+Create FNAT services with VIP on each ISP line:
+
+```bash
+# --- Telecom VIP service ---
+ipvsadm -A -t 219.141.136.10:80 -s rr
+ipvsadm -a -t 219.141.136.10:80 -r 10.0.0.1:80 -b
+
+# --- Unicom VIP service ---
+ipvsadm -A -t 202.106.0.20:80 -s rr
+ipvsadm -a -t 202.106.0.20:80 -r 10.0.0.1:80 -b
+
+# --- Mobile VIP service ---
+ipvsadm -A -t 117.200.23.22:80 -s rr
+ipvsadm -a -t 117.200.23.22:80 -r 10.0.0.1:80 -b
+```
+
+All three VIPs can share the same backend servers — the return path is determined by source VIP, not by destination.
+
+## How It Works
+
+1. A client on Unicom accesses `202.106.0.20:80`. The packet arrives on `bond0.2`.
+2. DPVS does FNAT: destination becomes the RS, source becomes LIP `202.106.0.100`.
+3. RS responds to LIP. DPVS translates back: source becomes VIP `202.106.0.20`.
+4. `route4_output()` is called with `fl4_saddr = 202.106.0.20`. It looks up this address, finds it belongs to `bond0.2`, and prefers the default route on `bond0.2` (via `202.106.0.1`).
+5. The return packet exits through `bond0.2` to the Unicom gateway — same path as the inbound traffic.
+
+Without policy routing, step 4 would pick the first default route (e.g., Telecom's), causing asymmetric routing and packet drops.
+
+## Verification
+
+```bash
+# Confirm all three default routes exist
+$ dpip route show
+default via 219.141.136.1 dev bond0.1
+default via 202.106.0.1 dev bond0.2
+default via 117.200.23.1 dev bond0.3
+219.141.136.0/24 dev bond0.1 scope link
+202.106.0.0/24 dev bond0.2 scope link
+117.200.23.0/24 dev bond0.3 scope link
+
+# Confirm VIPs are assigned
+$ dpip addr show
+inet 219.141.136.10/24 scope global bond0.1
+inet 202.106.0.20/24 scope global bond0.2
+inet 117.200.23.22/24 scope global bond0.3
+
+# Confirm services are up
+$ ipvsadm -ln
+TCP  219.141.136.10:80 rr
+  -> 10.0.0.1:80    FullNat ...
+TCP  202.106.0.20:80 rr
+  -> 10.0.0.1:80    FullNat ...
+TCP  117.200.23.22:80 rr
+  -> 10.0.0.1:80    FullNat ...
+```
+
+To verify the correct output path, send traffic to each VIP from its respective ISP network and confirm return packets use the expected gateway (e.g., using `tcpdump` on the host or the upstream router).
+
+## Notes
+
+* Policy routing works for FNAT, SNAT, and NAT modes. DR and Tunnel modes do not use `route4_output()` for return traffic (RS replies directly to clients).
+* The fast xmit path caches the output device and next-hop MAC after the first packet of a connection. Policy routing only affects the initial route lookup — subsequent packets of the same connection are forwarded via the cached path.
+* IPv6 policy routing is not yet supported. It can be added similarly by modifying `route6_output()` in a future release.
+* If `fl4_saddr` is not set (e.g., locally originated traffic), behavior falls back to the original destination-only route selection — fully backward compatible.
 
 <a id='ipv6_support'/>
 
